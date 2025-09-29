@@ -1,8 +1,10 @@
-streamlit
-dotenv
-sklearn
+streamlit>=1.25.0
+python-dotenv
 groq
 langchain
 langchain-community
 qdrant-client
 sentence-transformers
+bert-score
+torch
+transformers

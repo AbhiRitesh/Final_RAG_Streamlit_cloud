@@ -4,7 +4,6 @@ from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
-# NOTE: do not import Groq here — Groq client is created in app.py and passed into RAGPipeline
 import os
 
 # --- Collection name constant (unchanged) ---
