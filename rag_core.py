@@ -4,19 +4,11 @@ from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
-from groq import Groq
+# NOTE: do not import Groq here — Groq client is created in app.py and passed into RAGPipeline
 import os
 
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
-
-# --- Configuration ---
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+# --- Collection name constant (unchanged) ---
 COLLECTION_NAME = "startup_proposals"
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # --- 1. Data Loading and Chunking ---
 def load_and_chunk_documents(directory="data"):
@@ -46,6 +38,7 @@ def load_and_chunk_documents(directory="data"):
 # --- 2. Embedding Model ---
 class BGEEmbeddings:
     def __init__(self, model_name="BAAI/bge-base-en-v1.5"):
+        # SentenceTransformers model; load here once when initialized
         self.model = SentenceTransformer(model_name)
 
     def embed_documents(self, texts):
@@ -55,19 +48,33 @@ class BGEEmbeddings:
         return self.model.encode([text], normalize_embeddings=True).tolist()[0]
 
 # --- 3. Qdrant Vector Database & Indexing ---
-def initialize_qdrant_client():
-    if QDRANT_API_KEY:
-        client = QdrantClient(
-            url=QDRANT_HOST,
-            api_key=QDRANT_API_KEY,
-        )
+def initialize_qdrant_client(host=None, api_key=None):
+    """
+    Initialize a QdrantClient given host and api_key.
+    - If api_key is provided, create cloud-style client with url and api_key.
+    - If no api_key but host looks like a host string, create local client with default port 6333.
+    """
+    if host is None:
+        host = "localhost"
+
+    if api_key:
+        # Assume host is a URL like "https://your-qdrant-host"
+        client = QdrantClient(url=host, api_key=api_key)
     else:
-        client = QdrantClient(host=QDRANT_HOST, port=6333)
+        # Local connection (host may be 'localhost' or IP)
+        # QdrantClient accepts host + port kwargs for local
+        try:
+            client = QdrantClient(host=host, port=6333)
+        except Exception as e:
+            # fallback to URL style
+            client = QdrantClient(url=host)
     return client
 
-def index_documents_to_qdrant(chunks, embeddings_model):
-    client = initialize_qdrant_client()
-
+def index_documents_to_qdrant(chunks, embeddings_model, client):
+    """
+    Index document chunks to Qdrant using a provided QdrantClient.
+    This function expects `client` to be already initialized.
+    """
     try:
         client.recreate_collection(
             collection_name=COLLECTION_NAME,
@@ -80,6 +87,7 @@ def index_documents_to_qdrant(chunks, embeddings_model):
 
     points = []
     for i, chunk in enumerate(chunks):
+        # chunk.page_content and chunk.metadata come from langchain loaders
         embedding = embeddings_model.embed_query(chunk.page_content)
         source_info = chunk.metadata.get('source', 'unknown')
         page_info = chunk.metadata.get('page', 'N/A')
@@ -116,11 +124,16 @@ class RAGPipeline:
             limit=top_k,
             query_filter=None
         )
-        context = [hit.payload["text"] for hit in search_result]
-        sources = [hit.payload["source"] for hit in search_result]
-        return "\n\n".join(context), sources
+        # search_result items are objects with `.payload`
+        context_texts = [hit.payload["text"] for hit in search_result]
+        sources = [hit.payload.get("source", "unknown") for hit in search_result]
+        return context_texts, sources
 
     def generate_response(self, query, context, few_shot_examples=None):
+        # Ensure context is a string to pass cleanly to the LLM
+        if isinstance(context, list):
+            context = "\n\n".join(context)
+
         system_message = {
             "role": "system",
             "content": (
@@ -154,10 +167,6 @@ class RAGPipeline:
         return chat_completion.choices[0].message.content
 
     def evaluate_with_judge(self, query, answer, context):
-        """
-        Uses an LLM as a judge to evaluate a generated answer.
-        The judge will assess the answer's correctness and faithfulness to the context.
-        """
         judge_system_prompt = {
             "role": "system",
             "content": (
@@ -167,7 +176,7 @@ class RAGPipeline:
                 "1. **Faithfulness**: Does the answer contain information that is directly supported by the context? "
                 "2. **Correctness**: Does the answer directly and accurately address the user's question, using only the provided context? "
                 "Provide a final verdict (e.g., 'Correct', 'Incorrect', 'Partially Correct') and a brief reasoning for your decision. "
-                "The format should be: 'Verdict: [Your Verdict]\nReasoning: [Your Reasoning]'"
+                "The format should be: 'Verdict: [Your Verdict]\\nReasoning: [Your Reasoning]'"
             )
         }
 
@@ -191,14 +200,13 @@ Evaluate the generated answer based on the criteria above.
         
         chat_completion = self.groq_client.chat.completions.create(
             messages=messages,
-            model="llama-3.1-8b-instant", # Using the same model for the judge
-            temperature=0.0, # Use a low temperature for deterministic evaluation
+            model="llama-3.1-8b-instant",
+            temperature=0.0,
             max_tokens=250
         )
 
         response_text = chat_completion.choices[0].message.content
         
-        # Parse the verdict and reasoning from the LLM's response
         verdict = "Could not parse verdict."
         reasoning = "Could not parse reasoning."
 
@@ -210,6 +218,6 @@ Evaluate the generated answer based on the criteria above.
                 elif line.startswith("Reasoning:"):
                     reasoning = line.replace("Reasoning:", "").strip()
         else:
-            reasoning = response_text # If parsing fails, use the entire response as reasoning
+            reasoning = response_text
         
         return verdict, reasoning

@@ -5,10 +5,25 @@ from groq import Groq
 from bert_score import score
 import re
 
-# Load environment variables from .env file
+def get_env(key, default=None):
+    # Prefer st.secrets if available (Streamlit Cloud), else fallback to env var
+    try:
+        # st.secrets behaves like a dict when deployed to Streamlit Cloud
+        if hasattr(st, "secrets") and st.secrets.get(key) is not None:
+            return st.secrets.get(key)
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+# Load environment variables from .env file for local dev (harmless on Cloud)
 load_dotenv()
 
-# Import core RAG functionalities
+# Get config values via get_env (so works on Streamlit Cloud where secrets live in st.secrets)
+GROQ_API_KEY = get_env("GROQ_API_KEY")
+QDRANT_HOST = get_env("QDRANT_HOST", "localhost")
+QDRANT_API_KEY = get_env("QDRANT_API_KEY")
+
+# Import core RAG functionalities (modified rag_core expects injectable clients/params)
 from rag_core import (
     load_and_chunk_documents,
     BGEEmbeddings,
@@ -22,13 +37,16 @@ from rag_core import (
 st.set_page_config(page_title="Startup Business Proposal RAG", layout="wide")
 st.title("Startup Business Proposal Q&A with RAG")
 
-# --- Environment Variable Check ---
-if not os.getenv("GROQ_API_KEY"):
-    st.error("GROQ_API_KEY environment variable not set. Please set it to proceed.")
+# --- Environment Variable Check (use get_env so Streamlit Cloud secrets work) ---
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY not set. On Streamlit Cloud add it to Secrets (Settings → Secrets).")
     st.stop()
-if not os.getenv("QDRANT_HOST") or not os.getenv("QDRANT_API_KEY"):
-    st.error("QDRANT_HOST or QDRANT_API_KEY environment variables not set. Please set them to proceed.")
-    st.stop()
+if not QDRANT_HOST or not QDRANT_API_KEY:
+    # It's valid to have a remote Qdrant with API key; if you run a local Qdrant without API key,
+    # you can set QDRANT_API_KEY to empty string and this check may be relaxed locally.
+    # For Cloud deployments, recommend putting QDRANT_HOST and QDRANT_API_KEY in Secrets.
+    st.warning("QDRANT_HOST or QDRANT_API_KEY not provided. Make sure your Qdrant details are set in Secrets or as environment variables.")
+    # Do not stop here — allow user to try initialize (it may work for local dev with defaults)
 
 # --- Initialize Session State ---
 if 'rag_initialized' not in st.session_state:
@@ -71,18 +89,18 @@ with st.sidebar:
                 embeddings_model = BGEEmbeddings()
                 st.session_state.embeddings_model = embeddings_model
 
-                # 3. Initialize Qdrant Client
+                # 3. Initialize Qdrant Client (pass host + api_key from secrets/env)
                 st.write("Initializing Qdrant client...")
-                qdrant_client = initialize_qdrant_client()
+                qdrant_client = initialize_qdrant_client(host=QDRANT_HOST, api_key=QDRANT_API_KEY)
                 st.session_state.qdrant_client = qdrant_client
 
                 # 4. Index Documents to Qdrant
                 st.write(f"Indexing documents to Qdrant collection: {COLLECTION_NAME}...")
-                index_documents_to_qdrant(all_chunks, embeddings_model)
+                index_documents_to_qdrant(all_chunks, embeddings_model, qdrant_client)
 
-                # 5. Initialize Groq Client
+                # 5. Initialize Groq Client (use get_env)
                 st.write("Initializing Groq client...")
-                groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+                groq_client = Groq(api_key=GROQ_API_KEY)
                 st.session_state.groq_client = groq_client
 
                 # 6. Initialize RAG Pipeline
@@ -105,7 +123,7 @@ with st.sidebar:
         if st.button(f"Remove Example {i+1}", key=f"remove_fs_{i}_sidebar"):
             st.session_state.few_shot_examples.pop(i)
             st.experimental_rerun()
-    
+
     new_q = st.text_input("New Few-Shot Question:", key="new_fs_q_sidebar")
     new_a = st.text_input("New Few-Shot Answer:", key="new_fs_a_sidebar")
     if st.button("Add Few-Shot Example", key="add_fs_button_sidebar"):
@@ -128,7 +146,7 @@ else:
                 try:
                     context, sources = st.session_state.rag_pipeline.retrieve_context(user_query)
                     
-                    context_display = "\n\n---\n\n".join(context)
+                    context_display = "\n\n---\n\n".join(context) if isinstance(context, list) else context
                     source_display = ", ".join(sources) if sources else "No specific sources found."
 
                     response = st.session_state.rag_pipeline.generate_response(user_query, context, st.session_state.few_shot_examples)
@@ -182,9 +200,7 @@ else:
         if st.session_state.current_bert_f1 is not None:
             st.metric(label="BERTScore F1", value=f"{st.session_state.current_bert_f1:.4f}")
             st.info(
-                "BERTScore is a more advanced F1-score that measures semantic similarity "
-                "using contextual word embeddings from a BERT model, rather than just "
-                "word overlap. A higher score indicates better semantic alignment."
+                "BERTScore is a semantic F1-score using contextual embeddings. A higher score indicates better semantic alignment."
             )
 
         st.markdown("---")
@@ -223,7 +239,7 @@ else:
                             max_tokens=256
                         ).choices[0].message.content
 
-                        score_match = re.search(r"Score: (\d)", judge_response)
+                        score_match = re.search(r"Score:\s*([1-5])", judge_response)
                         if score_match:
                             st.session_state.llm_judge_score = int(score_match.group(1))
                             st.session_state.llm_judge_reasoning = judge_response.replace(score_match.group(0), "").strip()
@@ -241,7 +257,5 @@ else:
             st.write("Reasoning:")
             st.write(st.session_state.llm_judge_reasoning)
             st.info(
-                "An LLM-as-a-Judge provides a human-like, qualitative evaluation of an answer. "
-                "It goes beyond a simple score by providing reasoning, which can be useful for "
-                "understanding the nuances of why an answer is considered good or bad."
+                "An LLM-as-a-Judge provides a human-like, qualitative evaluation of an answer."
             )
